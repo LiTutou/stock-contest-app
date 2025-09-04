@@ -1,0 +1,1 @@
+# stock-contest-app
