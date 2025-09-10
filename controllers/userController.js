@@ -13,40 +13,87 @@ const wechatLogin = async (req, res, next) => {
       throw new ApiError("缺少微信登录code", 400)
     }
 
-    // 通过code获取openid
-    const wechatResponse = await axios.get(
-      "https://api.weixin.qq.com/sns/jscode2session",
-      {
-        params: {
-          appid: process.env.WECHAT_APPID,
-          secret: process.env.WECHAT_APP_SECRET,
-          js_code: code,
-          grant_type: "authorization_code",
-        },
-      }
-    )
-
-    const { openid, unionid, session_key } = wechatResponse.data
-
-    if (!openid) {
-      throw new ApiError("微信登录失败", 400)
+    // 检查环境变量
+    if (!process.env.WECHAT_APPID || !process.env.WECHAT_APP_SECRET) {
+      logger.error("微信配置缺失: WECHAT_APPID 或 WECHAT_APP_SECRET 未配置")
+      throw new ApiError("服务器配置错误，请联系管理员", 500)
     }
 
+    logger.info(`开始微信登录，code: ${code.substring(0, 10)}...`)
+
+    // 通过code获取openid
+    let wechatResponse
+    try {
+      const url = "https://api.weixin.qq.com/sns/jscode2session"
+      const params = {
+        appid: process.env.WECHAT_APPID,
+        secret: process.env.WECHAT_APP_SECRET,
+        js_code: code,
+        grant_type: "authorization_code",
+      }
+
+      logger.info(`调用微信API: ${url}`)
+      logger.info(`AppID: ${process.env.WECHAT_APPID}`)
+
+      wechatResponse = await axios.get(url, { params })
+
+      logger.info(`微信API响应: ${JSON.stringify(wechatResponse.data)}`)
+    } catch (wxError) {
+      logger.error(`微信API调用失败: ${wxError.message}`)
+      throw new ApiError("微信服务器连接失败", 500)
+    }
+
+    const { openid, unionid, session_key, errcode, errmsg } =
+      wechatResponse.data
+
+    // 检查微信API返回的错误
+    if (errcode) {
+      logger.error(`微信API返回错误: ${errcode} - ${errmsg}`)
+
+      // 根据不同错误码给出提示
+      if (errcode === 40029) {
+        throw new ApiError("登录码无效，请重新登录", 400)
+      } else if (errcode === 40013) {
+        throw new ApiError("AppID配置错误", 500)
+      } else if (errcode === 40125) {
+        throw new ApiError("AppSecret配置错误", 500)
+      } else {
+        throw new ApiError(`微信登录失败: ${errmsg}`, 400)
+      }
+    }
+
+    if (!openid) {
+      logger.error("未获取到openid")
+      throw new ApiError("微信登录失败，未获取到用户标识", 400)
+    }
+
+    logger.info(`获取到openid: ${openid}`)
+
     // 查找或创建用户
-    let user = await User.findByOpenId(openid)
+    let user = await User.findOne({ where: { open_id: openid } })
 
     if (!user) {
       // 创建新用户
-      user = await User.create({
+      const userData = {
         open_id: openid,
-        union_id: unionid,
+        union_id: unionid || null,
         nickname: userInfo?.nickName || "股票达人",
         avatar: userInfo?.avatarUrl || null,
+        status: "active",
+        role: "user",
+        level: 1,
+        total_score: 0,
+        total_recommends: 0,
+        success_recommends: 0,
+        failed_recommends: 0,
+        current_streak: 0,
+        max_streak: 0,
         last_login_at: new Date(),
         last_active_at: new Date(),
-      })
+      }
 
-      logger.info(`新用户注册: ${user.id}`)
+      user = await User.create(userData)
+      logger.info(`新用户注册成功: ${user.id}`)
     } else {
       // 更新登录时间和用户信息
       await user.update({
@@ -55,6 +102,7 @@ const wechatLogin = async (req, res, next) => {
         last_login_at: new Date(),
         last_active_at: new Date(),
       })
+      logger.info(`用户登录成功: ${user.id}`)
     }
 
     // 生成JWT token
@@ -63,19 +111,32 @@ const wechatLogin = async (req, res, next) => {
         userId: user.id,
         openId: openid,
       },
-      process.env.JWT_SECRET,
+      process.env.JWT_SECRET || "default-secret-key",
       { expiresIn: process.env.JWT_EXPIRE || "7d" }
     )
+
+    // 返回用户信息（过滤敏感信息）
+    const safeUserInfo = {
+      id: user.id,
+      nickname: user.nickname,
+      avatar: user.avatar,
+      level: user.level,
+      total_score: user.total_score,
+      total_recommends: user.total_recommends,
+      success_recommends: user.success_recommends,
+      current_streak: user.current_streak,
+    }
 
     res.json({
       code: 200,
       message: "登录成功",
       data: {
         token,
-        userInfo: user.toJSON(),
+        userInfo: safeUserInfo,
       },
     })
   } catch (error) {
+    logger.error(`登录失败: ${error.message}`, error.stack)
     next(error)
   }
 }
@@ -126,30 +187,15 @@ const updateUserInfo = async (req, res, next) => {
       }
     }
 
-    // 检查手机号是否重复
-    if (phone && phone !== user.phone) {
-      const existingUser = await User.findOne({
-        where: {
-          phone,
-          id: { [require("sequelize").Op.ne]: user.id },
-        },
-      })
-
-      if (existingUser) {
-        throw new ApiError("手机号已被使用", 400)
-      }
-    }
-
     // 更新用户信息
     await user.update({
       nickname: nickname || user.nickname,
       avatar: avatar || user.avatar,
       phone: phone || user.phone,
       email: email || user.email,
-      last_active_at: new Date(),
     })
 
-    logger.info(`用户信息更新: ${user.id}`)
+    logger.info(`用户 ${user.id} 更新信息`)
 
     res.json({
       code: 200,
@@ -164,89 +210,82 @@ const updateUserInfo = async (req, res, next) => {
 // 获取用户统计
 const getUserStats = async (req, res, next) => {
   try {
-    const user = await User.findByPk(req.user.userId)
+    const userId = req.user.userId
 
+    const user = await User.findByPk(userId)
     if (!user) {
       throw new ApiError("用户不存在", 404)
     }
 
-    // 获取详细统计信息
-    const recommendStats = await Recommend.getStats(user.id)
-    const followStats = await Follow.getStats(user.id)
+    // 获取推荐统计
+    const recommendStats = await Recommend.findAll({
+      where: { user_id: userId },
+      attributes: [
+        [
+          require("sequelize").fn("COUNT", require("sequelize").col("id")),
+          "total",
+        ],
+        [
+          require("sequelize").fn(
+            "SUM",
+            require("sequelize").literal(
+              "CASE WHEN status = 'success' THEN 1 ELSE 0 END"
+            )
+          ),
+          "success",
+        ],
+        [
+          require("sequelize").fn(
+            "SUM",
+            require("sequelize").literal(
+              "CASE WHEN status = 'failed' THEN 1 ELSE 0 END"
+            )
+          ),
+          "failed",
+        ],
+        [
+          require("sequelize").fn(
+            "AVG",
+            require("sequelize").col("actual_return")
+          ),
+          "avg_return",
+        ],
+      ],
+      raw: true,
+    })
 
-    // 获取当前排名
-    const Ranking = require("../models/Ranking")
-    const weeklyRanking = await Ranking.getUserRanking(user.id, "weekly")
-    const monthlyRanking = await Ranking.getUserRanking(user.id, "monthly")
-    const totalRanking = await Ranking.getUserRanking(user.id, "total")
-
-    const stats = {
-      // 基本信息
-      totalScore: user.total_score,
-      currentScore: user.current_score,
-      level: user.level,
-
-      // 推荐统计
-      totalRecommends: user.total_recommends,
-      successRecommends: user.success_recommends,
-      failedRecommends: user.failed_recommends,
-      winRate:
-        user.total_recommends > 0
-          ? user.success_recommends / user.total_recommends
-          : 0,
-      currentStreak: user.current_streak,
-      maxStreak: user.max_streak,
-
-      // 详细统计
-      avgReturn: parseFloat(recommendStats?.avg_return) || 0,
-      maxReturn: parseFloat(recommendStats?.max_return) || 0,
-      minReturn: parseFloat(recommendStats?.min_return) || 0,
-
-      // 跟投统计
-      followStats: followStats.reduce((acc, stat) => {
-        acc[stat.follow_type] = {
-          count: parseInt(stat.count),
-          avgReturn: parseFloat(stat.avg_return) || 0,
-        }
-        return acc
-      }, {}),
-
-      // 排名信息
-      rankings: {
-        weekly: weeklyRanking
-          ? {
-              rank: weeklyRanking.rank,
-              score: weeklyRanking.score,
-              change: weeklyRanking.previous_rank
-                ? weeklyRanking.previous_rank - weeklyRanking.rank
-                : 0,
-            }
-          : null,
-        monthly: monthlyRanking
-          ? {
-              rank: monthlyRanking.rank,
-              score: monthlyRanking.score,
-              change: monthlyRanking.previous_rank
-                ? monthlyRanking.previous_rank - monthlyRanking.rank
-                : 0,
-            }
-          : null,
-        total: totalRanking
-          ? {
-              rank: totalRanking.rank,
-              score: totalRanking.score,
-              change: totalRanking.previous_rank
-                ? totalRanking.previous_rank - totalRanking.rank
-                : 0,
-            }
-          : null,
-      },
-    }
+    // 获取跟投统计
+    const followStats = await Follow.findAll({
+      where: { user_id: userId },
+      attributes: [
+        [
+          require("sequelize").fn("COUNT", require("sequelize").col("id")),
+          "total",
+        ],
+        [
+          require("sequelize").fn(
+            "AVG",
+            require("sequelize").col("actual_return")
+          ),
+          "avg_return",
+        ],
+      ],
+      raw: true,
+    })
 
     res.json({
       code: 200,
       message: "获取成功",
-      data: stats,
+      data: {
+        user: {
+          level: user.level,
+          total_score: user.total_score,
+          current_streak: user.current_streak,
+          max_streak: user.max_streak,
+        },
+        recommends: recommendStats[0] || {},
+        follows: followStats[0] || {},
+      },
     })
   } catch (error) {
     next(error)
@@ -256,24 +295,21 @@ const getUserStats = async (req, res, next) => {
 // 更新用户设置
 const updateSettings = async (req, res, next) => {
   try {
+    const userId = req.user.userId
     const settings = req.body
 
-    const user = await User.findByPk(req.user.userId)
-
+    const user = await User.findByPk(userId)
     if (!user) {
       throw new ApiError("用户不存在", 404)
     }
 
     // 合并设置
-    const newSettings = {
-      ...user.settings,
-      ...settings,
-    }
+    const currentSettings = user.settings || {}
+    const newSettings = { ...currentSettings, ...settings }
 
-    await user.update({
-      settings: newSettings,
-      last_active_at: new Date(),
-    })
+    await user.update({ settings: newSettings })
+
+    logger.info(`用户 ${userId} 更新设置`)
 
     res.json({
       code: 200,
@@ -288,8 +324,9 @@ const updateSettings = async (req, res, next) => {
 // 获取用户设置
 const getSettings = async (req, res, next) => {
   try {
-    const user = await User.findByPk(req.user.userId)
+    const userId = req.user.userId
 
+    const user = await User.findByPk(userId)
     if (!user) {
       throw new ApiError("用户不存在", 404)
     }
@@ -307,29 +344,21 @@ const getSettings = async (req, res, next) => {
 // 注销账户
 const deleteAccount = async (req, res, next) => {
   try {
-    const { password } = req.body // 如果需要密码确认
+    const userId = req.user.userId
 
-    const user = await User.findByPk(req.user.userId)
-
+    const user = await User.findByPk(userId)
     if (!user) {
       throw new ApiError("用户不存在", 404)
     }
 
-    // 软删除：修改状态而不是真正删除
-    await user.update({
-      status: "inactive",
-      nickname: `已注销用户_${user.id}`,
-      avatar: null,
-      phone: null,
-      email: null,
-      last_active_at: new Date(),
-    })
+    // 软删除：只是将状态改为deleted
+    await user.update({ status: "deleted" })
 
-    logger.info(`用户注销: ${user.id}`)
+    logger.info(`用户 ${userId} 注销账户`)
 
     res.json({
       code: 200,
-      message: "账户注销成功",
+      message: "账户已注销",
     })
   } catch (error) {
     next(error)
@@ -339,34 +368,13 @@ const deleteAccount = async (req, res, next) => {
 // 获取用户列表（管理员功能）
 const getUserList = async (req, res, next) => {
   try {
-    const {
-      page = 1,
-      limit = 20,
-      status = "active",
-      keyword = "",
-      sortBy = "total_score",
-      sortOrder = "DESC",
-    } = req.query
-
-    const offset = (page - 1) * limit
-    const where = {}
-
-    if (status !== "all") {
-      where.status = status
-    }
-
-    if (keyword) {
-      where[Op.or] = [
-        { nickname: { [Op.like]: `%${keyword}%` } },
-        { phone: { [Op.like]: `%${keyword}%` } },
-      ]
-    }
+    const { page = 1, limit = 20, status = "active" } = req.query
 
     const { count, rows } = await User.findAndCountAll({
-      where,
-      order: [[sortBy, sortOrder]],
+      where: { status },
       limit: parseInt(limit),
-      offset,
+      offset: (page - 1) * limit,
+      order: [["created_at", "DESC"]],
       attributes: { exclude: ["open_id", "union_id"] },
     })
 
@@ -374,13 +382,41 @@ const getUserList = async (req, res, next) => {
       code: 200,
       message: "获取成功",
       data: {
-        users: rows.map((user) => user.toJSON()),
+        list: rows,
         pagination: {
           total: count,
           page: parseInt(page),
           limit: parseInt(limit),
           pages: Math.ceil(count / limit),
         },
+      },
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+// 刷新Token
+const refreshToken = async (req, res, next) => {
+  try {
+    const userId = req.user.userId
+    const openId = req.user.openId
+
+    // 生成新的token
+    const newToken = jwt.sign(
+      {
+        userId: userId,
+        openId: openId,
+      },
+      process.env.JWT_SECRET || "default-secret-key",
+      { expiresIn: process.env.JWT_EXPIRE || "7d" }
+    )
+
+    res.json({
+      code: 200,
+      message: "Token刷新成功",
+      data: {
+        token: newToken,
       },
     })
   } catch (error) {
@@ -397,4 +433,5 @@ module.exports = {
   getSettings,
   deleteAccount,
   getUserList,
+  refreshToken,
 }

@@ -9,6 +9,7 @@ const {
   getSettings,
   deleteAccount,
   getUserList,
+  refreshToken,
 } = require("../controllers/userController")
 const { authenticate, authorize } = require("../middleware/authMiddleware")
 
@@ -23,6 +24,9 @@ router.post(
   ],
   wechatLogin
 )
+
+// 刷新Token（需要登录）
+router.post("/refresh-token", authenticate, refreshToken)
 
 // 获取用户信息（需要登录）
 router.get("/info", authenticate, getUserInfo)
